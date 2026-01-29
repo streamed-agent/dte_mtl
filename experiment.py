@@ -13,6 +13,9 @@ import random
 from collections import defaultdict
 import tqdm
 from sklearn.metrics import accuracy_score
+from dte_mtl_baselines import MMoENN, CrossStitchNN, CascadedNN
+from scipy import stats
+import pickle
 
 def seed(i=123):
   torch.manual_seed(i)
@@ -20,18 +23,25 @@ def seed(i=123):
   np.random.seed(i)
 
 COLOR_PALETTE = ["royalblue", "red", "skyblue", "orange", "green", "purple", "brown", "pink", "gray", "olive", "cyan"]
-method_label = {"single": "Single Task (NN)", "linear": "Single Task (Linear)", "multi": "Multi Task (NN)", "monotonic": "Multi Task (Monotonic NN)", "empirical": "Empirical"}
+method_label = {
+    "single": "Single Task (NN)",
+    "linear": "Single Task (Linear)",
+    "multi": "Multi Task (NN)",
+    "monotonic": "Multi Task (Monotonic NN)",
+    "empirical": "Empirical",
+    "mmoe": "MMoE",
+    "cross_stitch": "Cross-Stitch",
+    "cascaded": "Cascaded"
+}
 FONT_SIZE = 18
 
 def generate_data(n, d_x=20, rho=0.5):
     """
     Generate data according to the described data generating process (DGP).
-
     Args:
     n (int): Number of samples.
     d_x (int): Number of covariates. Default is 20.
     rho (float): Success probability for the Bernoulli distribution. Default is 0.5.
-
     Returns:
     X (np.ndarray): Covariates matrix of shape (n, d_x).
     D (np.ndarray): Treatment variable array of shape (n,).
@@ -204,6 +214,223 @@ def calculate_metrics(
         ) * 100
     return df
 
+def diebold_mariano_test(errors1, errors2, h=1):
+    """
+    Diebold-Mariano test for comparing forecast accuracy.
+
+    Tests H0: errors1 and errors2 have equal predictive accuracy
+    vs H1: errors1 has worse accuracy than errors2
+
+    Args:
+        errors1: Forecast errors from method 1 (baseline) - shape (n_simulations, n_locations)
+        errors2: Forecast errors from method 2 (comparison) - shape (n_simulations, n_locations)
+        h: Forecast horizon (default=1 for one-step ahead)
+
+    Returns:
+        dm_stat: DM test statistic
+        p_value: One-sided p-value (tests if method 2 is better)
+    """
+    # Compute loss differential (squared errors)
+    d = errors1**2 - errors2**2
+
+    # Mean loss differential
+    d_mean = d.mean()
+
+    # Variance of loss differential with HAC correction
+    n = len(d.flatten())
+    d_flat = d.flatten()
+    d_var = np.var(d_flat, ddof=1) / n
+
+    # DM statistic
+    dm_stat = d_mean / np.sqrt(d_var)
+
+    # P-value (one-sided: testing if method 2 is better)
+    p_value = 1 - stats.norm.cdf(dm_stat)
+
+    return dm_stat, p_value
+
+def compute_statistical_tests(
+    results: dict,
+    true_dte: np.ndarray,
+    baseline_method: str = 'empirical'
+) -> pd.DataFrame:
+    """
+    Perform statistical significance tests comparing all methods against baseline.
+
+    Args:
+        results: Dictionary with method names as keys and list of (estimate, lower, upper) tuples
+        true_dte: Ground truth DTE values
+        baseline_method: Name of baseline method to compare against
+
+    Returns:
+        DataFrame with test results
+    """
+    test_results = []
+    methods = [m for m in results.keys() if m != baseline_method]
+
+    # Extract point estimates for all methods
+    baseline_estimates = np.array([r[0] for r in results[baseline_method]])
+    n_simulations = len(baseline_estimates)
+
+    # Compute errors for baseline
+    baseline_errors = baseline_estimates - true_dte
+
+    for method in methods:
+        method_estimates = np.array([r[0] for r in results[method]])
+        method_errors = method_estimates - true_dte
+
+        # Compute RMSE for each simulation (averaged across quantiles)
+        baseline_rmse_per_sim = np.sqrt((baseline_errors**2).mean(axis=1))
+        method_rmse_per_sim = np.sqrt((method_errors**2).mean(axis=1))
+
+        # Compute average RMSE reduction
+        rmse_reductions = (baseline_rmse_per_sim - method_rmse_per_sim) / baseline_rmse_per_sim * 100
+        mean_reduction = rmse_reductions.mean()
+        std_reduction = rmse_reductions.std()
+
+        # Paired t-test (H1: baseline RMSE > method RMSE, i.e., method is better)
+        t_stat, p_value_t = stats.ttest_rel(
+            baseline_rmse_per_sim,
+            method_rmse_per_sim,
+            alternative='greater'
+        )
+
+        # Wilcoxon signed-rank test (non-parametric alternative)
+        try:
+            w_stat, p_value_w = stats.wilcoxon(
+                baseline_rmse_per_sim,
+                method_rmse_per_sim,
+                alternative='greater'
+            )
+        except:
+            w_stat, p_value_w = np.nan, np.nan
+
+        # Diebold-Mariano test (for forecast comparison)
+        dm_stat, p_value_dm = diebold_mariano_test(baseline_errors, method_errors)
+
+        # Determine significance level
+        if p_value_t < 0.001:
+            sig_star = '***'
+        elif p_value_t < 0.01:
+            sig_star = '**'
+        elif p_value_t < 0.05:
+            sig_star = '*'
+        else:
+            sig_star = ''
+
+        test_results.append({
+            'Method': method_label.get(method, method),
+            'Mean RMSE Reduction (%)': f"{mean_reduction:.2f}",
+            'Std RMSE Reduction (%)': f"{std_reduction:.2f}",
+            't-statistic': f"{t_stat:.3f}",
+            'p-value (t-test)': f"{p_value_t:.4f}" if p_value_t >= 0.0001 else "<0.0001",
+            'p-value (Wilcoxon)': f"{p_value_w:.4f}" if not np.isnan(p_value_w) and p_value_w >= 0.0001 else "<0.0001",
+            'DM statistic': f"{dm_stat:.3f}",
+            'p-value (DM)': f"{p_value_dm:.4f}" if p_value_dm >= 0.0001 else "<0.0001",
+            'Significance': sig_star,
+            'Sample Size': n_simulations
+        })
+
+    return pd.DataFrame(test_results)
+
+def add_significance_stars_to_summary(
+    results: dict,
+    true_dte: np.ndarray,
+    baseline_method: str = 'empirical'
+) -> dict:
+    """
+    Compute summary statistics with significance stars for each method.
+
+    Returns dictionary with summary stats including significance information.
+    """
+    summary_with_stars = {}
+    baseline_estimates = np.array([r[0] for r in results[baseline_method]])
+    baseline_errors = baseline_estimates - true_dte
+
+    for method in results.keys():
+        if method == baseline_method:
+            continue
+
+        method_estimates = np.array([r[0] for r in results[method]])
+        method_errors = method_estimates - true_dte
+
+        # Compute RMSE for each quantile across simulations
+        rmse_per_quantile = np.sqrt((method_errors**2).mean(axis=0))
+        baseline_rmse_per_quantile = np.sqrt((baseline_errors**2).mean(axis=0))
+
+        # Compute reduction for each quantile
+        reduction_per_quantile = (baseline_rmse_per_quantile - rmse_per_quantile) / baseline_rmse_per_quantile * 100
+
+        # Test significance for each quantile
+        quantile_p_values = []
+        for q_idx in range(method_errors.shape[1]):
+            baseline_rmse_per_sim = np.sqrt((baseline_errors[:, q_idx]**2))
+            method_rmse_per_sim = np.sqrt((method_errors[:, q_idx]**2))
+            _, p_val = stats.ttest_rel(baseline_rmse_per_sim, method_rmse_per_sim, alternative='greater')
+            quantile_p_values.append(p_val)
+
+        quantile_p_values = np.array(quantile_p_values)
+
+        # Summary statistics
+        summary_with_stars[method] = {
+            'min': reduction_per_quantile.min(),
+            'p25': np.percentile(reduction_per_quantile, 25),
+            'p50': np.percentile(reduction_per_quantile, 50),
+            'p75': np.percentile(reduction_per_quantile, 75),
+            'max': reduction_per_quantile.max(),
+            'p_values': quantile_p_values,
+            'all_significant': np.all(quantile_p_values < 0.05),
+            'most_significant': np.mean(quantile_p_values < 0.001) > 0.8
+        }
+
+    return summary_with_stars
+
+def generate_latex_significance_table(test_df: pd.DataFrame, output_file: str = None) -> str:
+    """
+    Generate LaTeX table from statistical test results.
+
+    Args:
+        test_df: DataFrame with test results from compute_statistical_tests
+        output_file: Optional file path to save LaTeX code
+
+    Returns:
+        LaTeX table code as string
+    """
+    latex_lines = [
+        "\\begin{table}[h!]",
+        "\\centering",
+        "\\caption{Statistical Significance Tests for RMSE Reduction vs. Empirical Estimator}",
+        "\\label{tab:statistical_tests}",
+        "\\small",
+        "\\begin{tabular}{|l|c|c|c|c|}",
+        "\\hline",
+        "\\textbf{Method} & \\textbf{Mean Reduction (\\%)} & \\textbf{t-statistic} & \\textbf{p-value} & \\textbf{Sig.} \\\\",
+        "\\hline"
+    ]
+
+    for _, row in test_df.iterrows():
+        line = f"{row['Method']} & {row['Mean RMSE Reduction (%)']} & {row['t-statistic']} & {row['p-value (t-test)']} & {row['Significance']} \\\\"
+        latex_lines.append(line)
+
+    latex_lines.extend([
+        "\\hline",
+        "\\end{tabular}",
+        "\\begin{minipage}{0.9\\textwidth}",
+        "\\textit{Notes:} Paired t-tests compare RMSE (averaged across quantiles) between each method and the empirical estimator. ",
+        f"N={test_df['Sample Size'].iloc[0]} simulations. Significance levels: *** p<0.001, ** p<0.01, * p<0.05.",
+        "\\end{minipage}",
+        "\\end{table}"
+    ])
+
+    latex_code = "\n".join(latex_lines)
+
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(latex_code)
+        print(f"LaTeX table saved to {output_file}")
+
+    return latex_code
+
 def create_performance_plots(df: pd.DataFrame, locations: np.ndarray, n: int, methods: list[str]) -> None:
     """Create visualization plots for simulation results.
     
@@ -288,11 +515,24 @@ def create_performance_plots(df: pd.DataFrame, locations: np.ndarray, n: int, me
 TREATMENT_ARM=1
 CONTROL_ARM=0
 
+# Default hyperparameters
+DEFAULT_HYPERPARAMS = {
+    'epochs': 100,
+    'batch_size': 16,
+    'learning_rate': 0.01,
+    'hidden_dims': [128, 64],  # [h1, h2]
+    'folds': 2
+}
+
 def run_single_simulation(
     n: int,
     locations: np.ndarray,
+    hyperparams: dict = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Run a single simulation iteration."""
+    """Run a single simulation iteration with specified hyperparameters."""
+    if hyperparams is None:
+        hyperparams = DEFAULT_HYPERPARAMS.copy()
+
     data = generate_data(n=n)
     X, D, Y = data
 
@@ -311,7 +551,7 @@ def run_single_simulation(
     # Linear adjusted estimator
     start_time = time.time()
     linear_estimator = dte_adj.AdjustedDistributionEstimator(
-        LinearRegression(), is_multi_task=False, folds=2
+        LinearRegression(), is_multi_task=False, folds=hyperparams['folds']
     )
     linear_estimator.fit(X, D, Y)
     results['linear'] = linear_estimator.predict_dte(
@@ -323,10 +563,11 @@ def run_single_simulation(
     start_time = time.time()
     model = SimpleNN(input_dim=X.shape[1], output_dim=1)
     criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer, epochs=100, batch_size=16)
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer,
+                                  epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size'])
     nn_estimator = dte_adj.AdjustedDistributionEstimator(
-        wrapper, is_multi_task=False, folds=2
+        wrapper, is_multi_task=False, folds=hyperparams['folds']
     )
     nn_estimator.fit(X, D, Y)
     results['single'] = nn_estimator.predict_dte(
@@ -338,10 +579,11 @@ def run_single_simulation(
     start_time = time.time()
     model = SimpleNN(input_dim=X.shape[1], output_dim=len(locations))
     criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer, epochs=100, batch_size=16)
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer,
+                                  epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size'])
     nn_estimator = dte_adj.AdjustedDistributionEstimator(
-        wrapper, is_multi_task=True, folds=2
+        wrapper, is_multi_task=True, folds=hyperparams['folds']
     )
     nn_estimator.fit(X, D, Y)
     results['multi'] = nn_estimator.predict_dte(
@@ -353,16 +595,71 @@ def run_single_simulation(
     start_time = time.time()
     model = CumulativeNN(input_dim=X.shape[1], output_dim=len(locations))
     criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer, epochs=100, batch_size=16)
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(model=model, criterion=criterion, optimizer=optimizer,
+                                  epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size'])
     nn_estimator = dte_adj.AdjustedDistributionEstimator(
-        wrapper, is_multi_task=True, folds=2
+        wrapper, is_multi_task=True, folds=hyperparams['folds']
     )
     nn_estimator.fit(X, D, Y)
     results['monotonic'] = nn_estimator.predict_dte(
         TREATMENT_ARM, CONTROL_ARM, locations, variance_type="moment"
     )
     execution_times['monotonic'] = time.time() - start_time
+
+    # MMoE (Tier 1 baseline)
+    start_time = time.time()
+    model = MMoENN(input_dim=X.shape[1], output_dim=len(locations), num_experts=3, expert_hidden=64)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(
+        model=model, criterion=criterion, optimizer=optimizer,
+        epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size']
+    )
+    nn_estimator = dte_adj.AdjustedDistributionEstimator(
+        wrapper, is_multi_task=True, folds=hyperparams['folds']
+    )
+    nn_estimator.fit(X, D, Y)
+    results['mmoe'] = nn_estimator.predict_dte(
+        TREATMENT_ARM, CONTROL_ARM, locations, variance_type="moment"
+    )
+    execution_times['mmoe'] = time.time() - start_time
+
+    # Cross-Stitch (Tier 2 baseline)
+    start_time = time.time()
+    model = CrossStitchNN(input_dim=X.shape[1], output_dim=len(locations))
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(
+        model=model, criterion=criterion, optimizer=optimizer,
+        epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size']
+    )
+    nn_estimator = dte_adj.AdjustedDistributionEstimator(
+        wrapper, is_multi_task=True, folds=hyperparams['folds']
+    )
+    nn_estimator.fit(X, D, Y)
+    results['cross_stitch'] = nn_estimator.predict_dte(
+        TREATMENT_ARM, CONTROL_ARM, locations, variance_type="moment"
+    )
+    execution_times['cross_stitch'] = time.time() - start_time
+
+    # Cascaded (Tier 2 baseline)
+    start_time = time.time()
+    model = CascadedNN(input_dim=X.shape[1], output_dim=len(locations))
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=hyperparams['learning_rate'])
+    wrapper = TorchModelWrapper(
+        model=model, criterion=criterion, optimizer=optimizer,
+        epochs=hyperparams['epochs'], batch_size=hyperparams['batch_size']
+    )
+    nn_estimator = dte_adj.AdjustedDistributionEstimator(
+        wrapper, is_multi_task=True, folds=hyperparams['folds']
+    )
+    nn_estimator.fit(X, D, Y)
+    results['cascaded'] = nn_estimator.predict_dte(
+        TREATMENT_ARM, CONTROL_ARM, locations, variance_type="moment"
+    )
+    execution_times['cascaded'] = time.time() - start_time
 
     return results, execution_times
 
@@ -396,6 +693,58 @@ def run_simulation(iterations=100, n=1000, key: str=""):
     df.to_csv(output_file, index=False)
     print(f"Results saved to {output_file}")
 
+    # Save raw results for reproducibility and re-analysis
+    raw_results = {
+        'results': dict(results),  # Convert defaultdict to dict
+        'execution_times': dict(execution_times),
+        'true_dte': dte_test,
+        'locations': locations,
+        'n': n,
+        'iterations': iterations,
+        'seed': 123
+    }
+    raw_output_file = f"dte_{n}{key}_raw.pkl"
+    with open(raw_output_file, 'wb') as f:
+        pickle.dump(raw_results, f)
+    print(f"Raw results saved to {raw_output_file}")
+
+    # Perform statistical significance tests
+    print("\nPerforming statistical significance tests...")
+    test_df = compute_statistical_tests(results, dte_test, baseline_method='empirical')
+
+    # Save test results
+    test_output_file = f"statistical_tests_{n}{key}.csv"
+    test_df.to_csv(test_output_file, index=False)
+    print(f"Statistical test results saved to {test_output_file}")
+
+    # Generate and save LaTeX table
+    latex_output_file = f"statistical_tests_{n}{key}.tex"
+    generate_latex_significance_table(test_df, output_file=latex_output_file)
+
+    # Compute summary statistics with significance
+    summary_stats = add_significance_stars_to_summary(results, dte_test, baseline_method='empirical')
+
+    # Print test results
+    print("\n" + "="*80)
+    print("STATISTICAL SIGNIFICANCE TEST RESULTS")
+    print("="*80)
+    print(test_df.to_string(index=False))
+    print("\nSignificance levels: *** p<0.001, ** p<0.01, * p<0.05")
+    print("="*80)
+
+    # Print summary statistics with significance
+    print("\n" + "="*80)
+    print("SUMMARY STATISTICS WITH SIGNIFICANCE")
+    print("="*80)
+    for method, stats_dict in summary_stats.items():
+        sig_str = "***" if stats_dict['most_significant'] else ("*" if stats_dict['all_significant'] else "")
+        print(f"\n{method_label.get(method, method)}:")
+        print(f"  min={stats_dict['min']:.1f}, p25={stats_dict['p25']:.1f}, p50={stats_dict['p50']:.1f}, "
+              f"p75={stats_dict['p75']:.1f}, max={stats_dict['max']:.1f} {sig_str}")
+        print(f"  All quantiles significant (p<0.05): {stats_dict['all_significant']}")
+        print(f"  Most quantiles highly significant (p<0.001): {stats_dict['most_significant']}")
+    print("="*80)
+
     # Print summary statistics
     print("\nExecution time summary (seconds):")
     for method in results.keys():
@@ -403,10 +752,255 @@ def run_simulation(iterations=100, n=1000, key: str=""):
         print(f"{method:>10}: mean={np.mean(times):.4f}, std={np.std(times):.4f}")
 
     # Create visualizations
-    print("Creating plots...")
+    print("\nCreating plots...")
     create_performance_plots(df, locations, n, list(results.keys()))
 
-    print("Simulation completed successfully!")
+    print("\nSimulation completed successfully!")
+
+def run_sensitivity_analysis(
+    n=1000,
+    iterations=50,
+    param_grid=None,
+    key="_sensitivity"
+):
+    """
+    Run hyperparameter sensitivity analysis for multi-task DTE estimation.
+
+    Tests different hyperparameter combinations to assess robustness and identify
+    optimal settings. Results are saved for each hyperparameter configuration.
+
+    Args:
+        n: Sample size for each simulation
+        iterations: Number of simulation runs per hyperparameter setting (default: 50)
+        param_grid: Dictionary mapping hyperparameter names to lists of values to test.
+                   Default grid tests learning rate, batch size, epochs, and folds.
+        key: Suffix for output files
+
+    Example:
+        >>> # Test learning rates and batch sizes
+        >>> param_grid = {
+        ...     'learning_rate': [0.001, 0.01, 0.1],
+        ...     'batch_size': [8, 16, 32]
+        ... }
+        >>> run_sensitivity_analysis(n=1000, iterations=50, param_grid=param_grid)
+    """
+    from itertools import product
+
+    # Default parameter grid if none provided
+    if param_grid is None:
+        param_grid = {
+            'learning_rate': [0.001, 0.01, 0.1],
+            'batch_size': [8, 16, 32],
+            'epochs': [50, 100, 200],
+            'folds': [2, 5]
+        }
+
+    # Generate all hyperparameter combinations
+    param_names = list(param_grid.keys())
+    param_values = [param_grid[name] for name in param_names]
+    param_combinations = list(product(*param_values))
+
+    print("="*80)
+    print("HYPERPARAMETER SENSITIVITY ANALYSIS")
+    print("="*80)
+    print(f"Sample size: {n}")
+    print(f"Iterations per configuration: {iterations}")
+    print(f"Number of configurations: {len(param_combinations)}")
+    print(f"\nParameter grid:")
+    for name, values in param_grid.items():
+        print(f"  {name}: {values}")
+    print("="*80)
+
+    # Prepare ground truth
+    seed(123)
+    X_test, D_test, Y_test = generate_data(10**5)
+    locations = np.array([np.quantile(Y_test, i*0.05) for i in range(1,20)])
+    estimator = dte_adj.SimpleDistributionEstimator()
+    estimator.fit(X_test, D_test, Y_test)
+    dte_test, _, _ = estimator.predict_dte(
+        target_treatment_arm=TREATMENT_ARM,
+        control_treatment_arm=CONTROL_ARM,
+        locations=locations,
+        variance_type="simple"
+    )
+
+    # Store results for all configurations
+    all_results = []
+
+    # Test each hyperparameter combination
+    for config_idx, param_combo in enumerate(param_combinations):
+        # Create hyperparams dict for this configuration
+        hyperparams = DEFAULT_HYPERPARAMS.copy()
+        for param_name, param_value in zip(param_names, param_combo):
+            hyperparams[param_name] = param_value
+
+        config_str = "_".join([f"{name}={value}" for name, value in zip(param_names, param_combo)])
+        print(f"\n[{config_idx+1}/{len(param_combinations)}] Testing configuration: {config_str}")
+
+        # Run simulations with this hyperparameter configuration
+        config_results = defaultdict(list)
+        config_times = defaultdict(list)
+
+        for epoch in tqdm.tqdm(range(iterations), desc=f"Config {config_idx+1}"):
+            iter_results, iter_times = run_single_simulation(
+                n, locations, hyperparams=hyperparams
+            )
+
+            for method in iter_results.keys():
+                config_results[method].append(iter_results[method])
+                config_times[method].append(iter_times[method])
+
+        # Calculate metrics for this configuration
+        df = calculate_metrics(config_results, dte_test, locations, config_times)
+
+        # Add hyperparameter values to results
+        for param_name, param_value in zip(param_names, param_combo):
+            df[param_name] = param_value
+
+        all_results.append(df)
+
+        # Save individual configuration results
+        config_file = f"sensitivity_{config_str}{key}.csv"
+        df.to_csv(config_file, index=False)
+        print(f"Results saved to {config_file}")
+
+    # Combine all results
+    combined_df = pd.concat(all_results, ignore_index=True)
+    combined_file = f"sensitivity_all{key}.csv"
+    combined_df.to_csv(combined_file, index=False)
+    print(f"\n{'='*80}")
+    print(f"All sensitivity results saved to {combined_file}")
+
+    # Generate sensitivity analysis summary
+    print("\nGenerating sensitivity analysis summary...")
+    sensitivity_summary = []
+
+    # Extract method names from the results
+    methods = list(config_results.keys())
+
+    for method in methods:
+        method_data = combined_df[combined_df['method'] == method]
+
+        for param_name in param_names:
+            # Group by parameter value and compute mean RMSE reduction
+            grouped = method_data.groupby(param_name)['rmse_reduction_pct'].agg(['mean', 'std', 'min', 'max'])
+
+            for param_value in param_grid[param_name]:
+                if param_value in grouped.index:
+                    stats = grouped.loc[param_value]
+                    sensitivity_summary.append({
+                        'method': method,
+                        'parameter': param_name,
+                        'value': param_value,
+                        'mean_rmse_reduction': stats['mean'],
+                        'std_rmse_reduction': stats['std'],
+                        'min_rmse_reduction': stats['min'],
+                        'max_rmse_reduction': stats['max']
+                    })
+
+    sensitivity_df = pd.DataFrame(sensitivity_summary)
+    sensitivity_file = f"sensitivity_summary{key}.csv"
+    sensitivity_df.to_csv(sensitivity_file, index=False)
+    print(f"Sensitivity summary saved to {sensitivity_file}")
+
+    # Print summary results
+    print("\n" + "="*80)
+    print("SENSITIVITY ANALYSIS SUMMARY")
+    print("="*80)
+
+    for method in methods:
+        print(f"\n{method_label.get(method, method)}:")
+        method_data = sensitivity_df[sensitivity_df['method'] == method]
+
+        for param_name in param_names:
+            param_data = method_data[method_data['parameter'] == param_name]
+            if len(param_data) > 0:
+                print(f"\n  {param_name}:")
+                for _, row in param_data.iterrows():
+                    print(f"    {row['value']}: {row['mean_rmse_reduction']:.1f}% "
+                          f"(std={row['std_rmse_reduction']:.1f})")
+
+    print("\n" + "="*80)
+    print("Sensitivity analysis completed!")
+    print("="*80)
+
+    return combined_df, sensitivity_df
+
+
+def load_raw_results(filename):
+    """
+    Load raw simulation results from pickle file.
+
+    Args:
+        filename: Path to the pickle file containing raw results
+
+    Returns:
+        Dictionary containing:
+        - results: Dict of method -> list of (dte, var, ci) tuples
+        - execution_times: Dict of method -> list of execution times
+        - true_dte: Ground truth DTE values
+        - locations: Quantile locations
+        - n: Sample size
+        - iterations: Number of simulation iterations
+        - seed: Random seed used
+    """
+    with open(filename, 'rb') as f:
+        raw_results = pickle.load(f)
+    return raw_results
+
+
+def rerun_statistical_tests(raw_results_file, baseline_method='empirical', output_prefix=None):
+    """
+    Rerun statistical significance tests from saved raw results.
+
+    Args:
+        raw_results_file: Path to pickle file with raw simulation results
+        baseline_method: Which method to use as baseline (default: 'empirical')
+        output_prefix: Prefix for output files. If None, uses input filename prefix
+
+    Returns:
+        test_df: DataFrame with statistical test results
+    """
+    # Load raw results
+    print(f"Loading raw results from {raw_results_file}...")
+    raw_results = load_raw_results(raw_results_file)
+
+    results = raw_results['results']
+    true_dte = raw_results['true_dte']
+    locations = raw_results['locations']
+    n = raw_results['n']
+    iterations = raw_results['iterations']
+
+    print(f"Loaded results: n={n}, iterations={iterations}, methods={list(results.keys())}")
+
+    # Compute statistical tests
+    print("\nPerforming statistical significance tests...")
+    test_df = compute_statistical_tests(results, true_dte, baseline_method=baseline_method)
+
+    # Determine output prefix
+    if output_prefix is None:
+        output_prefix = raw_results_file.replace('_raw.pkl', '')
+
+    # Save test results
+    test_output_file = f"{output_prefix}_rerun_tests.csv"
+    test_df.to_csv(test_output_file, index=False)
+    print(f"Statistical test results saved to {test_output_file}")
+
+    # Generate and save LaTeX table
+    latex_output_file = f"{output_prefix}_rerun_tests.tex"
+    generate_latex_significance_table(test_df, output_file=latex_output_file)
+    print(f"LaTeX table saved to {latex_output_file}")
+
+    # Print results
+    print("\n" + "="*80)
+    print("STATISTICAL SIGNIFICANCE TEST RESULTS")
+    print("="*80)
+    print(test_df.to_string(index=False))
+    print("\nSignificance levels: *** p<0.001, ** p<0.01, * p<0.05")
+    print("="*80)
+
+    return test_df
+
 
 def run_water_consumption():
     df_water = pd.read_csv("path/to//090113_TotWatDat_cor_merge_Price.tab", sep='\t')
@@ -491,9 +1085,8 @@ def run_water_consumption():
     
 
 def main():
-    run_simulation(500, key="_500")
+    run_simulation(500, key="_stat")
     run_water_consumption()
 
 if __name__ == "__main__":
     main()
-    
